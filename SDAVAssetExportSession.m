@@ -12,6 +12,7 @@
 
 
 #import "SDAVAssetExportSession.h"
+#import <CoreMedia/CMMetadata.h>
 
 @interface SDAVAssetExportSession ()
 
@@ -88,7 +89,8 @@
     
     self.reader.timeRange = self.timeRange;
     self.writer.shouldOptimizeForNetworkUse = self.shouldOptimizeForNetworkUse;
-    self.writer.metadata = self.metadata;
+    
+    
     
     NSArray *videoTracks = [self.asset tracksWithMediaType:AVMediaTypeVideo];
     
@@ -119,6 +121,7 @@
         {
             [self.reader addOutput:self.videoOutput];
         }
+        
         
         //
         // Video input
@@ -168,6 +171,8 @@
             [self.writer addInput:self.audioInput];
         }
     }
+    
+    self.writer.metadata = self.metadata;
     
     [self.writer startWriting];
     [self.reader startReading];
@@ -275,7 +280,7 @@
     return YES;
 }
 
-- (AVMutableVideoComposition *)buildDefaultVideoComposition
+- (AVMutableVideoComposition *)buildDefaultVideoComposition1
 {
     AVMutableVideoComposition *videoComposition = [AVMutableVideoComposition videoComposition];
     AVAssetTrack *videoTrack = [[self.asset tracksWithMediaType:AVMediaTypeVideo] objectAtIndex:0];
@@ -374,6 +379,205 @@
     videoComposition.instructions = @[passThroughInstruction];
     
     return videoComposition;
+}
+
+- (AVMutableVideoComposition *)buildDefaultVideoComposition
+{
+    AVMutableVideoComposition *videoComposition = [AVMutableVideoComposition videoComposition];
+    AVAssetTrack *videoTrack = [[self.asset tracksWithMediaType:AVMediaTypeVideo] objectAtIndex:0];
+    // get the frame rate from videoSettings, if not set then try to get it from the video track,
+    // if not set (mainly when asset is AVComposition) then use the default frame rate of 30
+    float trackFrameRate = 0;
+    if (self.videoSettings)
+    {
+        NSDictionary *videoCompressionProperties = [self.videoSettings objectForKey:AVVideoCompressionPropertiesKey];
+        if (videoCompressionProperties)
+        {
+            NSNumber *frameRate = [videoCompressionProperties objectForKey:AVVideoAverageNonDroppableFrameRateKey];
+            if (frameRate)
+            {
+                trackFrameRate = frameRate.floatValue;
+            }
+        }
+    }
+    else
+    {
+        trackFrameRate = [videoTrack nominalFrameRate];
+    }
+    
+    if (trackFrameRate == 0)
+    {
+        trackFrameRate = 30;
+    }
+    
+    videoComposition.frameDuration = CMTimeMake(1, trackFrameRate);
+    CGSize targetSize = CGSizeMake([self.videoSettings[AVVideoWidthKey] floatValue], [self.videoSettings[AVVideoHeightKey] floatValue]);
+    CGSize naturalSize = [videoTrack naturalSize];
+    CGAffineTransform transform = videoTrack.preferredTransform;
+    NSLog(@"Transform %@",NSStringFromCGAffineTransform(transform));
+    // workaround https://github.com/rs/SDAVAssetExportSession/issues/79
+    CGRect rect = {{0, 0}, naturalSize};
+    CGRect transformedRect = CGRectApplyAffineTransform(rect, transform);
+    // transformedRect should have origin at 0 if correct; otherwise add offset to correct it
+    transform.tx -= transformedRect.origin.x;
+    transform.ty -= transformedRect.origin.y;
+    // Workaround radar 31928389, see https://github.com/rs/SDAVAssetExportSession/pull/70 for more info
+    if (transform.ty == -560) {
+        transform.ty = 0;
+    }
+    
+    if (transform.tx == -560) {
+        transform.tx = 0;
+    }
+    
+    
+    CGFloat videoAngleInDegree  = atan2(transform.b, transform.a) * 180 / M_PI;
+    
+    if(transform.tx ==0 && transform.ty == 0){
+        if (videoAngleInDegree == 90) {
+            transform.tx = naturalSize.height;
+        }
+        if (videoAngleInDegree == -90) {
+            transform.ty = naturalSize.width;
+        }
+    }
+    
+    videoComposition.renderSize = naturalSize;
+    // center inside
+    {
+        float ratio;
+        float xratio = targetSize.width / naturalSize.width;
+        float yratio = targetSize.height / naturalSize.height;
+        ratio = MIN(xratio, yratio);
+        
+//        float postWidth = naturalSize.width * ratio;
+//        float postHeight = naturalSize.height * ratio;
+//        float transx = (targetSize.width - postWidth) / 2;
+//        float transy = (targetSize.height - postHeight) / 2;
+        float width = (videoAngleInDegree == 90) ? naturalSize.width : 0;
+        float height = (videoAngleInDegree == -90) ? naturalSize.height : 0;
+    
+        CGAffineTransform matrix = CGAffineTransformMakeTranslation( width, height);
+        matrix = CGAffineTransformScale(matrix, ratio / xratio, ratio / yratio);
+        if (videoAngleInDegree == 90) {
+            matrix = CGAffineTransformRotate(matrix, degreesToRadians(90));
+        } else if (videoAngleInDegree == -90) {
+            matrix = CGAffineTransformRotate(matrix, degreesToRadians(-90));
+        }
+        transform = CGAffineTransformConcat(transform, matrix);
+        
+    }
+    
+    NSArray *keys = @[@"tracks", @"availableMetadataFormats"];
+
+    dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
+    
+    [self.asset loadValuesAsynchronouslyForKeys:keys completionHandler:^{
+        
+        // Get the status of the loaded tracks, make the appropriate action
+        [keys enumerateObjectsUsingBlock:^(id  _Nonnull key, NSUInteger idx, BOOL * _Nonnull stop) {
+            [self statusOfValueForKey: key];
+        }];
+        
+        
+        
+        dispatch_semaphore_signal(semaphore);
+    }];
+    
+    dispatch_semaphore_wait(semaphore, DISPATCH_TIME_FOREVER);
+    #if !__has_feature(objc_arc)
+        dispatch_release(sema);
+    #endif
+    
+    NSLog(@"Transform after %@",NSStringFromCGAffineTransform(transform));
+    // Make a "pass through video track" video composition.
+    AVMutableVideoCompositionInstruction *passThroughInstruction = [AVMutableVideoCompositionInstruction videoCompositionInstruction];
+    passThroughInstruction.timeRange = CMTimeRangeMake(kCMTimeZero, self.asset.duration);
+    
+    AVMutableVideoCompositionLayerInstruction *passThroughLayer = [AVMutableVideoCompositionLayerInstruction videoCompositionLayerInstructionWithAssetTrack:videoTrack];
+    
+    [passThroughLayer setTransform:transform atTime:kCMTimeZero];
+    
+    passThroughInstruction.layerInstructions = @[passThroughLayer];
+    videoComposition.instructions = @[passThroughInstruction];
+    
+    return videoComposition;
+}
+
+-(void) statusOfValueForKey:(NSString*) key {
+    NSError *error = nil;
+    AVKeyValueStatus status =  [self.asset statusOfValueForKey:key error:&error];
+    
+    switch (status) {
+        case AVKeyValueStatusUnknown:
+            NSLog(@"%@ AVKeyValueStatusUnknown", key);
+            //Load tracks unknown error
+            break;
+        case AVKeyValueStatusFailed:
+            NSLog(@"%@ AVKeyValueStatusFailed", key);
+            //Loading tracks failed
+            break;
+        case AVKeyValueStatusLoading:
+            NSLog(@"%@ AVKeyValueStatusLoading", key);
+            //Load tracks
+            break;
+        case AVKeyValueStatusLoaded:
+            NSLog(@"%@ AVKeyValueStatusLoaded", key);
+            //Load tracks are finished
+            break;
+        case AVKeyValueStatusCancelled:
+            NSLog(@"%@ AVKeyValueStatusCancelled", key);
+            //Cancel the loading of tracks
+            break;
+    }
+    
+    status =  [self.asset statusOfValueForKey:key error:&error];
+    switch (status) {
+        case AVKeyValueStatusUnknown:
+            NSLog(@"AVKeyValueStatusUnknown");
+            //Load AVKeyValueStatusUnknown unknown error
+            break;
+        case AVKeyValueStatusFailed:
+            NSLog(@"AVKeyValueStatusFailed");
+            //Load AVKeyValueStatusUnknown failed
+            break;
+        case AVKeyValueStatusLoading:
+            NSLog(@"AVKeyValueStatusLoading");
+            //Load AVKeyValueStatusUnknown
+            break;
+        case AVKeyValueStatusLoaded:
+        {
+            NSLog(@"AVKeyValueStatusLoaded");
+            //Load AVKeyValueStatusUnknown is completed
+            //Get the metadata inside the videoAsset
+            NSMutableArray *metadata = [NSMutableArray array];
+            for (NSString *format in self.asset.availableMetadataFormats) {
+                NSLog(@"format %@", format);
+                NSLog(@"[self.asset metadataForFormat:format] %@", [self.asset metadataForFormat:format]);
+                [metadata addObject:[self.asset metadataForFormat:format]];
+                
+                
+            }
+            for (NSArray<AVMetadataItem *> *m in metadata) {
+                for (AVMetadataItem *item in m) {
+                    NSLog(@"%@--%@\n",item.key, item.value);
+                }
+            }
+            self.metadata = metadata.firstObject;
+            
+            break;
+        }
+        case AVKeyValueStatusCancelled:
+            NSLog(@"AVKeyValueStatusCancelled");
+            //Unload AVKeyValueStatusUnknown
+            break;
+            
+    }
+}
+
+CGFloat degreesToRadians(CGFloat degrees)
+{
+  return degrees / 180.0 * M_PI;
 }
 
 - (void)finish
