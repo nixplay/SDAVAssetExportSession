@@ -86,6 +86,8 @@
  */
 @property (nonatomic, copy) NSDictionary *videoSettings;
 
+
+@property (nonatomic, assign) int videoAngle;
 /**
  * The settings used for encoding the audio track.
  *
