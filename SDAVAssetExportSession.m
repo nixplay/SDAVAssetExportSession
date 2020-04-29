@@ -550,7 +550,12 @@ static inline CGFloat degreesToRadian(int degrees) {
             }
             for (NSArray<AVMetadataItem *> *m in metadata) {
                 for (AVMetadataItem *item in m) {
-                    NSLog(@"%@--%@\n",item.key, item.value);
+                    NSString *itemValue = [NSString stringWithFormat:@"%@", item.value];
+                    if ([itemValue rangeOfString:@"Record"].location != NSNotFound) {
+                        NSLog(@"ReplayKitRecording");
+                        self.videoAngle = 0;
+                    }
+                    // NSLog(@"%@--%@\n",item.key, item.value);
                 }
             }
             self.metadata = metadata.firstObject;
