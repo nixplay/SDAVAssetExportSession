@@ -552,8 +552,11 @@ static inline CGFloat degreesToRadian(int degrees) {
                 for (AVMetadataItem *item in m) {
                     NSString *itemValue = [NSString stringWithFormat:@"%@", item.value];
                     if ([itemValue rangeOfString:@"Record"].location != NSNotFound) {
-                        NSLog(@"ReplayKitRecording");
-                        self.videoAngle = 0;
+                        // handle landscape recording to be portrait                        
+                        if (self.videoAngle != 90) {
+                            self.videoAngle = 0;
+                        }
+                        // NSLog(@"ReplayKitRecording");
                     }
                     // NSLog(@"%@--%@\n",item.key, item.value);
                 }
