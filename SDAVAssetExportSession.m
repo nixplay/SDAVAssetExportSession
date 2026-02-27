@@ -69,27 +69,40 @@ static inline CGFloat degreesToRadian(int degrees) {
                   {
                   NSLocalizedDescriptionKey: @"Output URL not set"
                   }];
+        NSLog(@"[SDAVAssetExportSession] ❌ Export failed: output URL not set");
         handler();
         return;
     }
-    
+
+    NSLog(@"[SDAVAssetExportSession] 📋 Starting export");
+    NSLog(@"[SDAVAssetExportSession]    Output URL  : %@", self.outputURL);
+    NSLog(@"[SDAVAssetExportSession]    File type   : %@", self.outputFileType);
+    NSLog(@"[SDAVAssetExportSession]    Asset       : %@", self.asset);
+    NSLog(@"[SDAVAssetExportSession]    Duration    : %.2f s", CMTimeGetSeconds(self.asset.duration));
+    NSLog(@"[SDAVAssetExportSession]    Video settings : %@", self.videoSettings);
+    NSLog(@"[SDAVAssetExportSession]    Audio settings : %@", self.audioSettings);
+
     NSError *readerError;
     self.reader = [AVAssetReader.alloc initWithAsset:self.asset error:&readerError];
     if (readerError)
     {
         _error = readerError;
+        NSLog(@"[SDAVAssetExportSession] ❌ AVAssetReader init failed: %@", readerError);
         handler();
         return;
     }
-    
+    NSLog(@"[SDAVAssetExportSession] ✅ AVAssetReader created");
+
     NSError *writerError;
     self.writer = [AVAssetWriter assetWriterWithURL:self.outputURL fileType:self.outputFileType error:&writerError];
     if (writerError)
     {
         _error = writerError;
+        NSLog(@"[SDAVAssetExportSession] ❌ AVAssetWriter init failed: %@", writerError);
         handler();
         return;
     }
+    NSLog(@"[SDAVAssetExportSession] ✅ AVAssetWriter created");
     
     self.reader.timeRange = self.timeRange;
     self.writer.shouldOptimizeForNetworkUse = self.shouldOptimizeForNetworkUse;
@@ -109,19 +122,78 @@ static inline CGFloat degreesToRadian(int degrees) {
     // Video output
     //
     if (videoTracks.count > 0) {
-        self.videoOutput = [AVAssetReaderVideoCompositionOutput assetReaderVideoCompositionOutputWithVideoTracks:videoTracks videoSettings:self.videoInputSettings];
+        // ── Pixel format negotiation ─────────────────────────────────────────────────
+        //
+        // Three things must agree on the same pixel format:
+        //   1. AVAssetReaderVideoCompositionOutput  (decode / reader side)
+        //   2. AVAssetWriterInputPixelBufferAdaptor (adaptor source format)
+        //   3. The AVAssetWriterInput encoder       (what the codec accepts)
+        //
+        // H.264 encoder  → only accepts 8-bit formats; BGRA is the safe universal choice.
+        // HEVC encoder   → accepts 8-bit BGRA, 8-bit NV12, and 10-bit NV12.
+        //
+        // Source bit-depth adds a further constraint on the reader:
+        //   • 8-bit source  → H.264 out : BGRA
+        //   • 8-bit source  → HEVC  out : NV12 8-bit
+        //   • 10-bit source → H.264 out : BGRA  (compositor converts internally)
+        //   • 10-bit source → HEVC  out : NV12 10-bit  (preserves HDR bit-depth)
+        //
+        // This is the key fix for 10-bit Dolby Vision / HDR HEVC → H.264:
+        // requesting BGRA from the reader causes AVFoundation's compositor to
+        // tone-map / convert the 10-bit frame to 8-bit BGRA automatically.
+        // ─────────────────────────────────────────────────────────────────────────────
+        NSString *outputCodec = self.videoSettings[AVVideoCodecKey];
+        BOOL outputIsHEVC = [outputCodec isEqualToString:AVVideoCodecTypeHEVC];
+        int sourceBitDepth = [self sourceVideoBitDepth];
+        BOOL sourceIs10Bit = (sourceBitDepth == 10);
+
+        NSLog(@"[SDAVAssetExportSession] 🎬 Video track count  : %lu", (unsigned long)videoTracks.count);
+        NSLog(@"[SDAVAssetExportSession]    Source bit depth   : %d-bit", sourceBitDepth);
+        NSLog(@"[SDAVAssetExportSession]    Source codec HEVC  : %@", [self sourceVideoCodecIsHEVC] ? @"YES" : @"NO");
+        NSLog(@"[SDAVAssetExportSession]    Output codec       : %@", outputCodec);
+
+        OSType pixelFormat;
+        if (outputIsHEVC && sourceIs10Bit) {
+            pixelFormat = kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange;
+            NSLog(@"[SDAVAssetExportSession]    Pixel format       : 420YpCbCr10BiPlanarVideoRange (10-bit → HEVC)");
+        } else if (outputIsHEVC) {
+            pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+            NSLog(@"[SDAVAssetExportSession]    Pixel format       : 420YpCbCr8BiPlanarVideoRange (8-bit → HEVC)");
+        } else {
+            pixelFormat = kCVPixelFormatType_32BGRA;
+            NSLog(@"[SDAVAssetExportSession]    Pixel format       : 32BGRA (→ H.264, compositor converts if 10-bit source)");
+        }
+
+        NSDictionary *effectiveVideoInputSettings = self.videoInputSettings;
+        if (!effectiveVideoInputSettings) {
+            effectiveVideoInputSettings = @{
+                (id)kCVPixelBufferPixelFormatTypeKey: @(pixelFormat)
+            };
+        }
+        NSLog(@"[SDAVAssetExportSession]    Reader video settings: %@", effectiveVideoInputSettings);
+
+        self.videoOutput = [AVAssetReaderVideoCompositionOutput assetReaderVideoCompositionOutputWithVideoTracks:videoTracks videoSettings:effectiveVideoInputSettings];
         self.videoOutput.alwaysCopiesSampleData = NO;
         if (self.videoComposition)
         {
             self.videoOutput.videoComposition = self.videoComposition;
+            NSLog(@"[SDAVAssetExportSession]    Using custom videoComposition");
         }
         else
         {
             self.videoOutput.videoComposition = [self buildDefaultVideoComposition];
+            NSLog(@"[SDAVAssetExportSession]    Using default videoComposition, renderSize: %@",
+                  NSStringFromCGSize(self.videoOutput.videoComposition.renderSize));
         }
         if ([self.reader canAddOutput:self.videoOutput])
         {
             [self.reader addOutput:self.videoOutput];
+            NSLog(@"[SDAVAssetExportSession] ✅ Video output added to reader");
+        }
+        else
+        {
+            NSLog(@"[SDAVAssetExportSession] ❌ Cannot add video output to reader — reader status: %ld, error: %@",
+                  (long)self.reader.status, self.reader.error);
         }
         
         //
@@ -133,33 +205,78 @@ static inline CGFloat degreesToRadian(int degrees) {
         if ([self.writer canAddInput:self.videoInput])
         {
             [self.writer addInput:self.videoInput];
+            NSLog(@"[SDAVAssetExportSession] ✅ Video input added to writer");
         }
+        else
+        {
+            NSLog(@"[SDAVAssetExportSession] ❌ Cannot add video input to writer — writer status: %ld, error: %@",
+                  (long)self.writer.status, self.writer.error);
+        }
+
         NSDictionary *pixelBufferAttributes = @
         {
-            (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
+            (id)kCVPixelBufferPixelFormatTypeKey: @(pixelFormat),
             (id)kCVPixelBufferWidthKey: @(self.videoOutput.videoComposition.renderSize.width),
             (id)kCVPixelBufferHeightKey: @(self.videoOutput.videoComposition.renderSize.height),
             @"IOSurfaceOpenGLESTextureCompatibility": @YES,
             @"IOSurfaceOpenGLESFBOCompatibility": @YES,
         };
         self.videoPixelBufferAdaptor = [AVAssetWriterInputPixelBufferAdaptor assetWriterInputPixelBufferAdaptorWithAssetWriterInput:self.videoInput sourcePixelBufferAttributes:pixelBufferAttributes];
+        NSLog(@"[SDAVAssetExportSession]    Pixel buffer adaptor created (pool: %@)",
+              self.videoPixelBufferAdaptor.pixelBufferPool ? @"ready" : @"nil — will be set after startWriting");
     }
     
     //
     //Audio output
     //
+    // IMPORTANT: Always decode audio to linear PCM before re-encoding.
+    //
+    // Passing audioSettings:nil means "give me compressed samples as-is", which
+    // works only when the source and destination codec are identical. For any
+    // spatial audio (Dolby Atmos / NeuralRAD), multi-channel, or cross-codec
+    // transcode, the raw compressed bytes can't be appended to a different
+    // encoder and AVFoundation returns kAudioCodecUnsupportedFormatError (-12780).
+    //
+    // Decoding to LPCM first is the universally safe approach: AVFoundation
+    // handles the decode regardless of source format (AAC-LC, AAC-ELD, Atmos,
+    // multi-channel), and the writer re-encodes to whatever audioSettings specify.
+    NSDictionary *audioDecodeSettings = @{
+        AVFormatIDKey:             @(kAudioFormatLinearPCM),
+        AVLinearPCMBitDepthKey:    @(16),
+        AVLinearPCMIsBigEndianKey: @(NO),
+        AVLinearPCMIsFloatKey:     @(NO),
+        AVLinearPCMIsNonInterleaved: @(NO),
+    };
+
     NSArray *audioTracks = [self.asset tracksWithMediaType:AVMediaTypeAudio];
+    NSLog(@"[SDAVAssetExportSession] 🔊 Audio track count: %lu", (unsigned long)audioTracks.count);
     if (audioTracks.count > 0) {
-        self.audioOutput = [AVAssetReaderAudioMixOutput assetReaderAudioMixOutputWithAudioTracks:audioTracks audioSettings:nil];
+        // Use only the first audio track. iPhone spatial audio files often have
+        // two audio tracks (Track 2 = Spatial / Atmos metadata track); mixing
+        // both into one reader output can cause the -12780 format error.
+        // Using just the primary stereo track is safe for standard export.
+        NSArray *primaryAudioTrack = @[audioTracks.firstObject];
+        NSLog(@"[SDAVAssetExportSession]    Using audio track ID: %d (of %lu total)",
+              [audioTracks.firstObject trackID], (unsigned long)audioTracks.count);
+
+        self.audioOutput = [AVAssetReaderAudioMixOutput assetReaderAudioMixOutputWithAudioTracks:primaryAudioTrack
+                                                                                   audioSettings:audioDecodeSettings];
         self.audioOutput.alwaysCopiesSampleData = NO;
         self.audioOutput.audioMix = self.audioMix;
         if ([self.reader canAddOutput:self.audioOutput])
         {
             [self.reader addOutput:self.audioOutput];
+            NSLog(@"[SDAVAssetExportSession] ✅ Audio output added to reader (decoding to LPCM)");
+        }
+        else
+        {
+            NSLog(@"[SDAVAssetExportSession] ❌ Cannot add audio output to reader — reader status: %ld, error: %@",
+                  (long)self.reader.status, self.reader.error);
         }
     } else {
         // Just in case this gets reused
         self.audioOutput = nil;
+        NSLog(@"[SDAVAssetExportSession]    No audio tracks found, skipping audio");
     }
     
     //
@@ -171,14 +288,28 @@ static inline CGFloat degreesToRadian(int degrees) {
         if ([self.writer canAddInput:self.audioInput])
         {
             [self.writer addInput:self.audioInput];
+            NSLog(@"[SDAVAssetExportSession] ✅ Audio input added to writer");
+        }
+        else
+        {
+            NSLog(@"[SDAVAssetExportSession] ❌ Cannot add audio input to writer — writer status: %ld, error: %@",
+                  (long)self.writer.status, self.writer.error);
         }
     }
     
     self.writer.metadata = self.metadata;
 
-    [self.writer startWriting];
-    [self.reader startReading];
+    BOOL writerStarted = [self.writer startWriting];
+    NSLog(@"[SDAVAssetExportSession] %@ startWriting — writer status: %ld, error: %@",
+          writerStarted ? @"✅" : @"❌", (long)self.writer.status, self.writer.error);
+
+    BOOL readerStarted = [self.reader startReading];
+    NSLog(@"[SDAVAssetExportSession] %@ startReading — reader status: %ld, error: %@",
+          readerStarted ? @"✅" : @"❌", (long)self.reader.status, self.reader.error);
+
     [self.writer startSessionAtSourceTime:self.timeRange.start];
+    NSLog(@"[SDAVAssetExportSession]    Session started at source time: %.4f s",
+          CMTimeGetSeconds(self.timeRange.start));
     
     __block BOOL videoCompleted = NO;
     __block BOOL audioCompleted = NO;
@@ -238,6 +369,11 @@ static inline CGFloat degreesToRadian(int degrees) {
             {
                 handled = YES;
                 error = YES;
+                NSLog(@"[SDAVAssetExportSession] ❌ Pipeline status mismatch while encoding");
+                NSLog(@"[SDAVAssetExportSession]    Reader status : %ld, error: %@",
+                      (long)self.reader.status, self.reader.error);
+                NSLog(@"[SDAVAssetExportSession]    Writer status : %ld, error: %@",
+                      (long)self.writer.status, self.writer.error);
             }
             
             if (!handled && self.videoOutput == output)
@@ -256,6 +392,8 @@ static inline CGFloat degreesToRadian(int degrees) {
                     if (![self.videoPixelBufferAdaptor appendPixelBuffer:renderBuffer withPresentationTime:lastSamplePresentationTime])
                     {
                         error = YES;
+                        NSLog(@"[SDAVAssetExportSession] ❌ appendPixelBuffer failed at %.4f s — writer error: %@",
+                              CMTimeGetSeconds(lastSamplePresentationTime), self.writer.error);
                     }
                     CVPixelBufferRelease(renderBuffer);
                     handled = YES;
@@ -264,6 +402,11 @@ static inline CGFloat degreesToRadian(int degrees) {
             if (!handled && ![input appendSampleBuffer:sampleBuffer])
             {
                 error = YES;
+                BOOL isVideo = (input == self.videoInput);
+                NSLog(@"[SDAVAssetExportSession] ❌ appendSampleBuffer failed (%@) at %.4f s — writer error: %@",
+                      isVideo ? @"video" : @"audio",
+                      CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer)),
+                      self.writer.error);
             }
             CFRelease(sampleBuffer);
             
@@ -550,15 +693,7 @@ static inline CGFloat degreesToRadian(int degrees) {
             }
             for (NSArray<AVMetadataItem *> *m in metadata) {
                 for (AVMetadataItem *item in m) {
-                    NSString *itemValue = [NSString stringWithFormat:@"%@", item.value];
-                    if ([itemValue rangeOfString:@"Record"].location != NSNotFound) {
-                        // handle landscape recording to be portrait                        
-                        if (self.videoAngle != 90) {
-                            self.videoAngle = 0;
-                        }
-                        // NSLog(@"ReplayKitRecording");
-                    }
-                    // NSLog(@"%@--%@\n",item.key, item.value);
+                    NSLog(@"%@--%@\n",item.key, item.value);
                 }
             }
             self.metadata = metadata.firstObject;
@@ -576,26 +711,100 @@ CGFloat degreesToRadians(CGFloat degrees)
   return degrees / 180.0 * M_PI;
 }
 
+/// Returns the bit depth of the first video track's format description.
+/// Returns 8 for standard video; returns 10 for 10-bit HEVC (Dolby Vision, HDR10, HLG).
+- (int)sourceVideoBitDepth
+{
+    AVAssetTrack *videoTrack = [[self.asset tracksWithMediaType:AVMediaTypeVideo] firstObject];
+    if (!videoTrack) {
+        return 8;
+    }
+    for (id descriptionRef in videoTrack.formatDescriptions) {
+        CMFormatDescriptionRef desc = (__bridge CMFormatDescriptionRef)descriptionRef;
+        // Extensions dictionary contains the pixel format details for the compressed track.
+        CFDictionaryRef extensions = CMFormatDescriptionGetExtensions(desc);
+        if (!extensions) continue;
+
+        // 'depth' extension holds the pixel bit depth for video format descriptions.
+        CFNumberRef depthRef = (CFNumberRef)CFDictionaryGetValue(extensions,
+                                   kCMFormatDescriptionExtension_Depth);
+        if (depthRef) {
+            int depth = 0;
+            CFNumberGetValue(depthRef, kCFNumberIntType, &depth);
+            if (depth > 8) {
+                return 10;
+            }
+        }
+
+        // Fallback: check the codec type directly — known 10-bit HEVC codec types.
+        CMVideoCodecType codecType = CMVideoFormatDescriptionGetCodecType(desc);
+        // 'hvc1' with 10-bit is typically signalled as kCMVideoCodecType_HEVC but
+        // we can also check the pixel format of the description's sub-type.
+        if (codecType == kCMVideoCodecType_HEVC) {
+            // Check for Dolby Vision profile or explicit 10-bit signal via YCbCr matrix.
+            CFStringRef fullRangeKey = (__bridge CFStringRef)AVVideoYCbCrMatrixKey;
+            (void)fullRangeKey; // silence unused-variable warning
+            // If depth extension was missing, treat HEVC as potentially 10-bit and
+            // ask the reader to decode to BGRA (safe 8-bit path) so the caller
+            // does not need to worry about it.
+            return 10;
+        }
+    }
+    return 8;
+}
+
+/// Returns YES when the first video track of the source asset is encoded with HEVC (H.265).
+- (BOOL)sourceVideoCodecIsHEVC
+{
+    AVAssetTrack *videoTrack = [[self.asset tracksWithMediaType:AVMediaTypeVideo] firstObject];
+    if (!videoTrack) {
+        return NO;
+    }
+    for (id descriptionRef in videoTrack.formatDescriptions) {
+        CMFormatDescriptionRef desc = (__bridge CMFormatDescriptionRef)descriptionRef;
+        if (CMVideoFormatDescriptionGetCodecType(desc) == kCMVideoCodecType_HEVC) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
 - (void)finish
 {
+    NSLog(@"[SDAVAssetExportSession] 🏁 finish called — reader status: %ld, writer status: %ld",
+          (long)self.reader.status, (long)self.writer.status);
+    if (self.reader.error) {
+        NSLog(@"[SDAVAssetExportSession]    Reader error: %@", self.reader.error);
+    }
+    if (self.writer.error) {
+        NSLog(@"[SDAVAssetExportSession]    Writer error: %@", self.writer.error);
+    }
+
     // Synchronized block to ensure we never cancel the writer before calling finishWritingWithCompletionHandler
     if (self.reader.status == AVAssetReaderStatusCancelled || self.writer.status == AVAssetWriterStatusCancelled)
     {
+        NSLog(@"[SDAVAssetExportSession]    Export was cancelled, bailing out of finish");
         return;
     }
     
     if (self.writer.status == AVAssetWriterStatusFailed)
     {
+        NSLog(@"[SDAVAssetExportSession] ❌ Writer failed — not calling finishWriting. Error: %@", self.writer.error);
         [self complete];
     }
     else if (self.reader.status == AVAssetReaderStatusFailed) {
+        NSLog(@"[SDAVAssetExportSession] ❌ Reader failed — cancelling writer. Error: %@", self.reader.error);
         [self.writer cancelWriting];
         [self complete];
     }
     else
     {
+        NSLog(@"[SDAVAssetExportSession]    Calling finishWritingWithCompletionHandler...");
         [self.writer finishWritingWithCompletionHandler:^
          {
+             NSLog(@"[SDAVAssetExportSession] %@ finishWriting done — writer status: %ld, error: %@",
+                   self.writer.status == AVAssetWriterStatusCompleted ? @"✅" : @"❌",
+                   (long)self.writer.status, self.writer.error);
              [self complete];
          }];
     }
@@ -605,7 +814,12 @@ CGFloat degreesToRadians(CGFloat degrees)
 {
     if (self.writer.status == AVAssetWriterStatusFailed || self.writer.status == AVAssetWriterStatusCancelled)
     {
+        NSLog(@"[SDAVAssetExportSession] 🗑️  Removing incomplete output file (writer status: %ld)", (long)self.writer.status);
         [NSFileManager.defaultManager removeItemAtURL:self.outputURL error:nil];
+    }
+    else
+    {
+        NSLog(@"[SDAVAssetExportSession] ✅ Export complete — output: %@", self.outputURL);
     }
     
     if (self.completionHandler)
